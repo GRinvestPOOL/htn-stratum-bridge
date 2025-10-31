@@ -277,6 +277,7 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 	// fmt.Printf("Block: %s\n", jsonHeader)
 	converted, err := appmessage.RPCBlockToDomainBlock(submitInfo.block, submitInfo.powHash.String())
 	if err != nil {
+		ctx.Logger.Info(fmt.Sprintf("RPCBlockToDomainBlock failed: Pow hash %s", submitInfo.powHash.String()))
 		RecordInvalidShare(ctx)
 		return ctx.ReplyIncorrectData(event.Id)
 	}
@@ -285,7 +286,7 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 	powState := pow.NewState(mutableHeader)
 	// fmt.Printf("Block version: %d\n", powState.BlockVersion)
 	// fmt.Printf("Block prevHeader: %s\n", powState.PrevHeader.String())
-	recalculatedPowNum, _ := powState.CalculateProofOfWorkValue()
+	recalculatedPowNum, recalculatedPoWHash := powState.CalculateProofOfWorkValue()
 	submittedPowNum := toBig(submitInfo.powHash)
 
 	// The block hash must be less or equal than the claimed target.
@@ -304,12 +305,14 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 					ctx.Logger.Warn("block rejected, incorred pow")
 					stats.StaleShares.Add(1)
 					sh.overall.InvalidShares.Add(1)
+					ctx.Logger.Info(fmt.Sprintf("Block rejected invalid pow: Pow hash: %s, recalculated: %s", submitInfo.powHash.String(), recalculatedPoWHash.String()))
 					RecordInvalidShare(ctx)
 					return ctx.ReplyIncorrectPow(event.Id)
 				} else {
 					ctx.Logger.Warn("block rejected, unknown issue", zap.Error(err))
 					stats.InvalidShares.Add(1)
 					sh.overall.InvalidShares.Add(1)
+					ctx.Logger.Info(fmt.Sprintf("Block rejected unknown issue: Pow hash: %s, recalculated: %s", submitInfo.powHash.String(), recalculatedPoWHash.String()))
 					RecordInvalidShare(ctx)
 					return ctx.ReplyBadShare(event.Id)
 				}
@@ -328,6 +331,7 @@ func (sh *shareHandler) HandleSubmit(ctx *gostratum.StratumContext, event gostra
 	} else {
 		stats.InvalidShares.Add(1)
 		sh.overall.InvalidShares.Add(1)
+		ctx.Logger.Info(fmt.Sprintf("Block rejected invalid pow: Pow hash: %s, recalculated: %s", submitInfo.powHash.String(), recalculatedPoWHash.String()))
 		RecordInvalidShare(ctx)
 		return ctx.ReplyIncorrectPow(event.Id)
 	}

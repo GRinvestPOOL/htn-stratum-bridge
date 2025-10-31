@@ -32,7 +32,7 @@ type clientListener struct {
 }
 
 func newClientListener(logger *zap.SugaredLogger, shareHandler *shareHandler, minShareDiff float64, extranonceSize int8) *clientListener {
-	return &clientListener{
+	cl := &clientListener{
 		logger:         logger,
 		minShareDiff:   minShareDiff,
 		extranonceSize: extranonceSize,
@@ -42,6 +42,11 @@ func newClientListener(logger *zap.SugaredLogger, shareHandler *shareHandler, mi
 		shareHandler:   shareHandler,
 		clients:        make(map[int32]*gostratum.StratumContext),
 	}
+	
+	// Start health monitoring goroutine
+	go cl.healthMonitor()
+	
+	return cl
 }
 
 func (c *clientListener) OnConnect(ctx *gostratum.StratumContext) {
@@ -84,13 +89,27 @@ func (c *clientListener) OnDisconnect(ctx *gostratum.StratumContext) {
 }
 
 func (c *clientListener) NewBlockAvailable(htnApi *HtnApi, soloMining bool, poll int64, vote int64) {
-	c.clientLock.Lock()
+	// Create a snapshot of clients to minimize lock time
+	c.clientLock.RLock()
+	clientSnapshot := make([]*gostratum.StratumContext, 0, len(c.clients))
 	addresses := make([]string, 0, len(c.clients))
+	
 	for _, cl := range c.clients {
 		if !cl.Connected() {
 			continue
 		}
+		clientSnapshot = append(clientSnapshot, cl)
+	}
+	c.clientLock.RUnlock()
+	
+	// Process clients outside of lock
+	for _, cl := range clientSnapshot {
 		go func(client *gostratum.StratumContext) {
+			// Skip unhealthy clients immediately to prevent blocking
+			if !client.IsHealthy() {
+				return
+			}
+			
 			state := GetMiningState(client)
 			if client.WalletAddr == "" {
 				if time.Since(state.connectTime) > time.Second*20 { // timeout passed
@@ -161,29 +180,37 @@ func (c *clientListener) NewBlockAvailable(htnApi *HtnApi, soloMining bool, poll
 				jobParams = append(jobParams, template.Block.Header.Timestamp)
 			}
 
-			// // normal notify flow
-			if err := client.Send(gostratum.JsonRpcEvent{
+			// Normal notify flow with timeout protection
+			notifyEvent := gostratum.JsonRpcEvent{
 				Version: "2.0",
 				Method:  "mining.notify",
 				Id:      jobId,
 				Params:  jobParams,
-			}); err != nil {
-				if errors.Is(err, gostratum.ErrorDisconnected) {
-					RecordWorkerError(client.WalletAddr, ErrDisconnected)
-					return
-				}
-				RecordWorkerError(client.WalletAddr, ErrFailedSendWork)
-				client.Logger.Error(errors.Wrapf(err, "failed sending work packet %d", jobId).Error())
 			}
-
+			
+			// Send in a goroutine with timeout to prevent blocking the whole system
+			go func() {
+				if err := client.Send(notifyEvent); err != nil {
+					if errors.Is(err, gostratum.ErrorDisconnected) {
+						RecordWorkerError(client.WalletAddr, ErrDisconnected)
+						return
+					}
+					RecordWorkerError(client.WalletAddr, ErrFailedSendWork)
+					client.Logger.Warn(errors.Wrapf(err, "failed sending work packet %d", jobId).Error())
+					
+					// If send fails, the client might be having issues
+					// The health monitor will catch repeatedly failing clients
+				}
+			}()
+			
 			RecordNewJob(client)
+
 		}(cl)
 
 		if cl.WalletAddr != "" {
 			addresses = append(addresses, cl.WalletAddr)
 		}
 	}
-	c.clientLock.Unlock()
 
 	if time.Since(c.lastBalanceCheck) > balanceDelay {
 		c.lastBalanceCheck = time.Now()
@@ -201,13 +228,51 @@ func (c *clientListener) NewBlockAvailable(htnApi *HtnApi, soloMining bool, poll
 }
 
 func sendClientDiff(client *gostratum.StratumContext, state *MiningState) {
-	if err := client.Send(gostratum.JsonRpcEvent{
-		Version: "2.0",
-		Method:  "mining.set_difficulty",
-		Params:  []any{state.stratumDiff.diffValue},
-	}); err != nil {
-		RecordWorkerError(client.WalletAddr, ErrFailedSetDiff)
-		client.Logger.Error(errors.Wrap(err, "failed sending difficulty").Error())
+	// Skip if client is unhealthy
+	if !client.IsHealthy() {
 		return
+	}
+	
+	// Send difficulty in goroutine to avoid blocking
+	go func() {
+		if err := client.Send(gostratum.JsonRpcEvent{
+			Version: "2.0",
+			Method:  "mining.set_difficulty",
+			Params:  []any{state.stratumDiff.diffValue},
+		}); err != nil {
+			RecordWorkerError(client.WalletAddr, ErrFailedSetDiff)
+			client.Logger.Warn(errors.Wrap(err, "failed sending difficulty").Error())
+		}
+	}()
+}
+
+func (c *clientListener) healthMonitor() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			c.clientLock.Lock()
+			var unhealthyClients []int32
+			
+			for id, client := range c.clients {
+				if !client.IsHealthy() {
+					c.logger.Warn("client marked as unhealthy, will be disconnected", 
+						"client_id", id, 
+						"wallet", client.WalletAddr,
+						"remote_addr", client.RemoteAddr)
+					unhealthyClients = append(unhealthyClients, id)
+				}
+			}
+			
+			// Disconnect unhealthy clients
+			for _, id := range unhealthyClients {
+				if client, exists := c.clients[id]; exists {
+					go client.Disconnect()
+				}
+			}
+			c.clientLock.Unlock()
+		}
 	}
 }

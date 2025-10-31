@@ -3,6 +3,7 @@ package gostratum
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -14,7 +15,8 @@ import (
 
 func spawnClientListener(ctx *StratumContext, connection net.Conn, s *StratumListener) error {
 	defer ctx.Disconnect()
-
+	
+	protocolError := false
 	for {
 		err := readFromConnection(connection, func(line string) error {
 			event, err := UnmarshalEvent(line)
@@ -34,7 +36,26 @@ func spawnClientListener(ctx *StratumContext, connection net.Conn, s *StratumLis
 			return ctx.parentContext.Err() // parent context cancelled
 		}
 		if err != nil { // actual error
-			ctx.Logger.Error("error reading from socket", zap.Error(err))
+			// Check if this looks like a protocol error (ADB, HTTP, etc.)
+			if strings.Contains(err.Error(), "protocol detected") {
+				protocolError = true
+				ctx.Logger.Info("non-stratum protocol detected, disconnecting", zap.Error(err))
+			} else {
+				ctx.Logger.Error("error reading from socket", zap.Error(err))
+			}
+			
+			// Mark IP for rate limiting if it's a protocol error
+			if protocolError {
+				s.connectionMutex.Lock()
+				s.failedConnections[ctx.RemoteAddr] = time.Now()
+				// Clean up old entries (older than 1 minute)
+				for ip, timestamp := range s.failedConnections {
+					if time.Since(timestamp) > time.Minute {
+						delete(s.failedConnections, ip)
+					}
+				}
+				s.connectionMutex.Unlock()
+			}
 			return err
 		}
 	}
@@ -49,11 +70,26 @@ func readFromConnection(connection net.Conn, cb LineCallback) error {
 	}
 
 	buffer := make([]byte, 8096*2)
-	_, err := connection.Read(buffer)
+	n, err := connection.Read(buffer)
 	if err != nil {
 		return errors.Wrapf(err, "error reading from connection")
 	}
-	buffer = bytes.ReplaceAll(buffer, []byte("\x00"), nil)
+	
+	// Check for non-stratum protocols and reject them early
+	if n >= 4 {
+		// Check for ADB protocol (starts with "CNXN")
+		if bytes.HasPrefix(buffer[:n], []byte("CNXN")) {
+			return fmt.Errorf("ADB protocol detected, not a stratum client")
+		}
+		// Check for HTTP requests
+		if bytes.HasPrefix(buffer[:n], []byte("GET ")) || 
+		   bytes.HasPrefix(buffer[:n], []byte("POST ")) ||
+		   bytes.HasPrefix(buffer[:n], []byte("HEAD ")) {
+			return fmt.Errorf("HTTP protocol detected, not a stratum client")
+		}
+	}
+	
+	buffer = bytes.ReplaceAll(buffer[:n], []byte("\x00"), nil)
 	scanner := bufio.NewScanner(strings.NewReader(string(buffer)))
 	for scanner.Scan() {
 		if err := cb(scanner.Text()); err != nil {

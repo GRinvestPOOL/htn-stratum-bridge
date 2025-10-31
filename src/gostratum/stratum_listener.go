@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
@@ -40,6 +41,9 @@ type StratumListener struct {
 	disconnectChannel DisconnectChannel
 	stats             StratumStats
 	workerGroup       sync.WaitGroup
+	// Rate limiting for repeated failed connections
+	failedConnections map[string]time.Time
+	connectionMutex   sync.RWMutex
 }
 
 func NewListener(cfg StratumListenerConfig) *StratumListener {
@@ -47,6 +51,7 @@ func NewListener(cfg StratumListenerConfig) *StratumListener {
 		StratumListenerConfig: cfg,
 		workerGroup:           sync.WaitGroup{},
 		disconnectChannel:     make(DisconnectChannel),
+		failedConnections:     make(map[string]time.Time),
 	}
 
 	listener.Logger = listener.Logger.With(
@@ -92,6 +97,17 @@ func (s *StratumListener) newClient(ctx context.Context, connection net.Conn) {
 	if len(parts) > 0 {
 		addr = parts[0] // trim off the port
 	}
+	
+	// Check for rate limiting - if this IP failed recently, reject
+	s.connectionMutex.RLock()
+	lastFailed, exists := s.failedConnections[addr]
+	s.connectionMutex.RUnlock()
+	
+	if exists && time.Since(lastFailed) < 10*time.Second {
+		s.Logger.Debug("rejecting connection from rate-limited IP", zap.String("addr", addr))
+		connection.Close()
+		return
+	}
 	clientContext := &StratumContext{
 		parentContext: ctx,
 		RemoteAddr:    addr,
@@ -99,6 +115,7 @@ func (s *StratumListener) newClient(ctx context.Context, connection net.Conn) {
 		connection:    connection,
 		State:         s.StateGenerator(),
 		onDisconnect:  s.disconnectChannel,
+		lastActivity:  time.Now(),
 	}
 
 	s.Logger.Info(fmt.Sprintf("new client connecting - %s", addr))
